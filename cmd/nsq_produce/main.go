@@ -9,13 +9,13 @@ import (
 	"github.com/minus5/svckit/metric/statsd"
 	"github.com/minus5/svckit/nsq"
 	"os"
-	"strings"
 	"sync"
+	"time"
 )
 
-type input_message struct {
-	topic string
-	data  map[string]interface{}
+type InputMessage struct {
+	Topic string                 `json:"topic"`
+	Data  map[string]interface{} `json:"data"`
 }
 
 var topic string
@@ -40,7 +40,6 @@ func main() {
 
 	wg := sync.WaitGroup{}
 	loop := func() {
-		wg.Add(1)
 		for true {
 			var entries []os.DirEntry
 			var err error
@@ -49,13 +48,8 @@ func main() {
 				return
 			}
 
-			var m map[string][]map[string]interface{}
+			m := map[string][]map[string]interface{}{}
 			for _, entry := range entries {
-				if strings.HasSuffix(entry.Name(), ".json") {
-					s := strings.TrimSuffix(entry.Name(), ".json")
-					topic = s
-				}
-
 				bytes, err := os.ReadFile(workingDir + "/" + entry.Name())
 				if err != nil {
 					log.Errorf("couldn't read file: "+workingDir+"/"+entry.Name(), err)
@@ -63,33 +57,40 @@ func main() {
 				}
 
 				if len(bytes) > 0 && bytes[0] == '[' {
-					var in []input_message
+					var in []InputMessage
 					json.Unmarshal(bytes, &in)
 					if len(in) > 0 {
 						for _, one := range in {
-							if m[one.topic] == nil {
-								m[one.topic] = []map[string]interface{}{}
+							if m[one.Topic] == nil {
+								m[one.Topic] = []map[string]interface{}{}
 							}
 
-							m[one.topic] = append(m[one.topic], one.data)
+							m[one.Topic] = append(m[one.Topic], one.Data)
 						}
 					}
 				} else {
-					var in input_message
-					json.Unmarshal(bytes, &in)
-					if m[in.topic] == nil {
-						m[in.topic] = []map[string]interface{}{}
+					in := InputMessage{}
+					err = json.Unmarshal(bytes, &in)
+					if err != nil || in.Topic == "" || in.Data == nil {
+						log.Errorf("input has nil values: topic and data must be specified")
+					}
+					if m[in.Topic] == nil {
+						m[in.Topic] = []map[string]interface{}{}
 					}
 
-					m[in.topic] = append(m[in.topic], in.data)
+					m[in.Topic] = append(m[in.Topic], in.Data)
+				}
+
+				if err := os.Remove(workingDir + "/" + entry.Name()); err != nil {
+					log.Errorf("failed to remove file after producing: %s", entry.Name())
 				}
 			}
 
-			var producers map[string]*nsq.Producer
+			producers := map[string]*nsq.Producer{}
 			for key := range m {
-				producer, err := nsq.NewProducer(topic)
+				producer, err := nsq.NewProducer(key)
 				if err != nil {
-					log.Errorf("couldn't open producer to topic: "+topic, err)
+					log.Errorf("couldn't open producer to topic: "+key, err)
 					continue
 				}
 
@@ -103,13 +104,20 @@ func main() {
 					if err != nil {
 						log.Errorf("failed to marshal message: ", err)
 					}
-					p.Publish(msg)
+					err = p.Publish(msg)
+					if err != nil {
+						log.Errorf("failed to publish message: ", err)
+					}
 				}
 			}
+
+			time.Sleep(2 * time.Second)
 		}
+
 		wg.Done()
 	}
 
+	wg.Add(1)
 	go loop()
 	wg.Wait()
 }
